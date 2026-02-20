@@ -1,0 +1,294 @@
+// db.js — Optimized PostgreSQL Connection (AirStream)
+import pkg from "pg";
+const { Pool } = pkg;
+
+// ============================================================
+// OPTIMIZED CONNECTION POOL
+// ============================================================
+export const pool = new Pool({
+  user: "vineet",
+  host: "localhost",
+  database: "airstream",
+  password: "vineet123",
+  port: 5432,
+
+  // CONNECTION POOL OPTIMIZATION
+  max: 20,                    // Maximum 20 connections
+  min: 5,                     // Minimum 5 connections maintained
+  idleTimeoutMillis: 30000,   // Close idle connections after 30 seconds
+  connectionTimeoutMillis: 5000,  // Timeout if connection takes > 5 seconds
+
+  // KEEP-ALIVE (Important for long-running connections)
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,  // Start keep-alive after 10 seconds
+
+  // STATEMENT TIMEOUT (Prevent hanging queries)
+  statement_timeout: 30000,   // Kill queries taking > 30 seconds
+});
+
+// ============================================================
+// CONNECTION ERROR HANDLING
+// ============================================================
+pool.on('error', (err, client) => {
+  console.error('? Unexpected database error:', err);
+  process.exit(-1);  // Exit process on critical DB error
+});
+
+pool.on('connect', () => {
+  console.log('? New database connection established');
+});
+
+pool.on('remove', () => {
+  console.log('??  Database connection removed from pool');
+});
+
+// ============================================================
+// DATABASE SCHEMA INITIALIZATION & OPTIMIZATION
+// ============================================================
+(async () => {
+  const client = await pool.connect();
+  try {
+    console.log("?? Checking database schema...");
+
+    // --------------------------------------------------------
+    // VIDEOS TABLE (ENHANCED)
+    // --------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS videos (
+        id SERIAL PRIMARY KEY,
+        filename VARCHAR(255) UNIQUE NOT NULL,
+        title VARCHAR(255) NOT NULL DEFAULT 'Untitled',
+        description TEXT,
+        category VARCHAR(50) DEFAULT 'General',
+        uploader_email VARCHAR(255) NOT NULL,
+        video_url TEXT,
+        status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'ready', 'error')),
+        duration INTEGER DEFAULT 0,
+        views INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        processed_at TIMESTAMP,
+        error_message TEXT,
+        
+        -- Additional metadata
+        thumbnails_base TEXT,
+        file_size BIGINT,
+        resolution VARCHAR(20),
+        codec VARCHAR(50)
+      );
+    `);
+
+    // --------------------------------------------------------
+    // CREATE INDEXES FOR VIDEOS TABLE
+    // --------------------------------------------------------
+    await client.query(`
+      -- Index for status filtering (most common query)
+      CREATE INDEX IF NOT EXISTS idx_videos_status 
+        ON videos(status) 
+        WHERE status = 'ready';
+
+      -- Index for uploader queries
+      CREATE INDEX IF NOT EXISTS idx_videos_uploader 
+        ON videos(uploader_email);
+
+      -- Index for category filtering
+      CREATE INDEX IF NOT EXISTS idx_videos_category 
+        ON videos(category);
+
+      -- Index for sorting by date (DESC for latest first)
+      CREATE INDEX IF NOT EXISTS idx_videos_created_at 
+        ON videos(created_at DESC);
+
+      -- Composite index for common query pattern
+      CREATE INDEX IF NOT EXISTS idx_videos_status_created 
+        ON videos(status, created_at DESC) 
+        WHERE status = 'ready';
+
+      -- Index for search by title (case-insensitive)
+      CREATE INDEX IF NOT EXISTS idx_videos_title_lower 
+        ON videos(LOWER(title));
+    `);
+
+    // --------------------------------------------------------
+    // VIDEO COMMENTS TABLE (NEW)
+    // --------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS video_comments (
+        id SERIAL PRIMARY KEY,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        user_email VARCHAR(255) NOT NULL,
+        comment_text TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP,
+        
+        CONSTRAINT comment_not_empty CHECK (length(trim(comment_text)) > 0)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_comments_video 
+        ON video_comments(video_id, created_at DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_comments_user 
+        ON video_comments(user_email);
+    `);
+
+    // --------------------------------------------------------
+    // VIDEO LIKES TABLE (NEW)
+    // --------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS video_likes (
+        id SERIAL PRIMARY KEY,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        user_email VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        
+        UNIQUE(video_id, user_email)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_likes_video 
+        ON video_likes(video_id);
+      
+      CREATE INDEX IF NOT EXISTS idx_likes_user 
+        ON video_likes(user_email);
+    `);
+
+    // --------------------------------------------------------
+    // LIVE STREAMS TABLE (NEW)
+    // --------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS live_streams (
+        id VARCHAR(255) PRIMARY KEY,
+        user_email VARCHAR(255) NOT NULL,
+        user_uid VARCHAR(255) NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        thumbnail TEXT,
+        stream_key VARCHAR(255) UNIQUE NOT NULL,
+        stream_url TEXT,
+        hls_url TEXT,
+        status VARCHAR(20) DEFAULT 'starting' CHECK (status IN ('starting', 'live', 'ended', 'error')),
+        viewers INTEGER DEFAULT 0,
+        peak_viewers INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        ended_at TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_streams_status 
+        ON live_streams(status) 
+        WHERE status IN ('starting', 'live');
+      
+      CREATE INDEX IF NOT EXISTS idx_streams_user 
+        ON live_streams(user_email);
+    `);
+
+    // --------------------------------------------------------
+    // COMPANIES TABLE (KEEP EXISTING)
+    // --------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS companies (
+        id SERIAL PRIMARY KEY,
+        company_name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_companies_email 
+        ON companies(email);
+    `);
+
+    // --------------------------------------------------------
+    // UPDATE EXISTING VIDEOS TABLE (IF NEEDED)
+    // --------------------------------------------------------
+    // Add missing columns to existing table
+    const addColumns = [
+      { name: 'title', type: 'VARCHAR(255)', default: "'Untitled'" },
+      { name: 'description', type: 'TEXT', default: 'NULL' },
+      { name: 'category', type: 'VARCHAR(50)', default: "'General'" },
+      { name: 'duration', type: 'INTEGER', default: '0' },
+      { name: 'views', type: 'INTEGER', default: '0' },
+      { name: 'likes', type: 'INTEGER', default: '0' },
+      { name: 'processed_at', type: 'TIMESTAMP', default: 'NULL' },
+      { name: 'error_message', type: 'TEXT', default: 'NULL' },
+    ];
+
+    for (const col of addColumns) {
+      try {
+        await client.query(`
+          ALTER TABLE videos 
+          ADD COLUMN IF NOT EXISTS ${col.name} ${col.type} DEFAULT ${col.default};
+        `);
+      } catch (err) {
+        // Column already exists, ignore
+      }
+    }
+
+    // --------------------------------------------------------
+    // VERIFY SETUP
+    // --------------------------------------------------------
+    const tableCount = await client.query(`
+      SELECT COUNT(*) FROM information_schema.tables 
+      WHERE table_schema = 'public';
+    `);
+
+    const indexCount = await client.query(`
+      SELECT COUNT(*) FROM pg_indexes 
+      WHERE schemaname = 'public';
+    `);
+
+    console.log("? Database schema verified");
+    console.log(`?? Tables: ${tableCount.rows[0].count}`);
+    console.log(`?? Indexes: ${indexCount.rows[0].count}`);
+
+  } catch (err) {
+    console.error("? DB init error:", err.message);
+    console.error(err.stack);
+  } finally {
+    client.release();
+  }
+})();
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+// Test database connection
+export async function testConnection() {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    console.log('? Database connection test successful:', result.rows[0].now);
+    return true;
+  } catch (err) {
+    console.error('? Database connection test failed:', err.message);
+    return false;
+  }
+}
+
+// Get connection pool stats
+export function getPoolStats() {
+  return {
+    total: pool.totalCount,
+    idle: pool.idleCount,
+    waiting: pool.waitingCount,
+  };
+}
+
+// Graceful shutdown
+export async function closePool() {
+  console.log('?? Closing database connection pool...');
+  await pool.end();
+  console.log('? Database pool closed');
+}
+
+// Handle process termination
+process.on('SIGTERM', async () => {
+  await closePool();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  await closePool();
+  process.exit(0);
+});
+
+// Export pool as default for backward compatibility
+export default pool;

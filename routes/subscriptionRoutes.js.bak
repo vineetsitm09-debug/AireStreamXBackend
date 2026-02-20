@@ -1,0 +1,257 @@
+// routes/subscriptionRoutes.js
+// ============================================================
+import express from 'express';
+import { pool } from '../db.js';
+import { verifyFirebaseToken } from '../middleware/verifyFirebaseToken.js';
+
+const router = express.Router();
+
+// ── Subscribe / Unsubscribe (toggle) ──────────────────────────────────────────
+router.post('/subscribe/:channelEmail', verifyFirebaseToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const channelEmail = decodeURIComponent(req.params.channelEmail);
+    const subscriberEmail = req.user.email;
+    const subscriberUid   = req.user.uid;
+
+    if (subscriberEmail === channelEmail) {
+      return res.status(400).json({ success: false, error: "Cannot subscribe to yourself" });
+    }
+
+    await client.query('BEGIN');
+
+    // Auto-create channel row if needed
+    await client.query(
+      `INSERT INTO channels (email, channel_name, subscriber_count)
+       VALUES ($1, $2, 0)
+       ON CONFLICT (email) DO NOTHING`,
+      [channelEmail, channelEmail.split('@')[0]]
+    );
+
+    const existing = await client.query(
+      'SELECT id FROM subscriptions WHERE subscriber_email=$1 AND channel_email=$2',
+      [subscriberEmail, channelEmail]
+    );
+
+    let subscribed;
+    if (existing.rowCount > 0) {
+      await client.query(
+        'DELETE FROM subscriptions WHERE subscriber_email=$1 AND channel_email=$2',
+        [subscriberEmail, channelEmail]
+      );
+      await client.query(
+        'UPDATE channels SET subscriber_count = GREATEST(subscriber_count-1,0) WHERE email=$1',
+        [channelEmail]
+      );
+      subscribed = false;
+    } else {
+      await client.query(
+        `INSERT INTO subscriptions (subscriber_email, subscriber_uid, channel_email)
+         VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+        [subscriberEmail, subscriberUid, channelEmail]
+      );
+      await client.query(
+        'UPDATE channels SET subscriber_count = subscriber_count+1 WHERE email=$1',
+        [channelEmail]
+      );
+      subscribed = true;
+    }
+
+    await client.query('COMMIT');
+
+    const countRow = await pool.query(
+      'SELECT subscriber_count FROM channels WHERE email=$1', [channelEmail]
+    );
+
+    res.json({
+      success: true,
+      subscribed,
+      subscriberCount: countRow.rows[0]?.subscriber_count || 0
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Subscribe error:', err);
+    res.status(500).json({ success: false, error: 'Failed to process subscription' });
+  } finally {
+    client.release();
+  }
+});
+
+// ── Subscription status ───────────────────────────────────────────────────────
+router.get('/subscription-status/:channelEmail', verifyFirebaseToken, async (req, res) => {
+  try {
+    const channelEmail    = decodeURIComponent(req.params.channelEmail);
+    const subscriberEmail = req.user.email;
+
+    const [statusResult, countResult] = await Promise.all([
+      pool.query(
+        'SELECT notifications_enabled FROM subscriptions WHERE subscriber_email=$1 AND channel_email=$2',
+        [subscriberEmail, channelEmail]
+      ),
+      pool.query(
+        'SELECT subscriber_count FROM channels WHERE email=$1',
+        [channelEmail]
+      )
+    ]);
+
+    res.json({
+      success: true,
+      subscribed: statusResult.rowCount > 0,
+      notificationsEnabled: statusResult.rows[0]?.notifications_enabled ?? false,
+      subscriberCount: countResult.rows[0]?.subscriber_count || 0
+    });
+  } catch (err) {
+    console.error('Subscription status error:', err);
+    res.status(500).json({ success: false, error: 'Failed to get status' });
+  }
+});
+
+// ── Subscriber count (public) ─────────────────────────────────────────────────
+router.get('/subscribers-count/:channelEmail', async (req, res) => {
+  try {
+    const channelEmail = decodeURIComponent(req.params.channelEmail);
+    const result = await pool.query(
+      'SELECT subscriber_count FROM channels WHERE email=$1',
+      [channelEmail]
+    );
+    res.json({ success: true, count: result.rows[0]?.subscriber_count || 0 });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to get count' });
+  }
+});
+
+// ── My subscriptions ──────────────────────────────────────────────────────────
+router.get('/subscriptions', verifyFirebaseToken, async (req, res) => {
+  try {
+    const subscriberEmail = req.user.email;
+
+    const result = await pool.query(
+      `SELECT 
+         s.channel_email,
+         COALESCE(c.channel_name, split_part(s.channel_email,'@',1)) as channel_name,
+         COALESCE(c.subscriber_count, 0)  as subscriber_count,
+         COALESCE(c.video_count, 0)       as video_count,
+         s.subscribed_at,
+         s.notifications_enabled
+       FROM subscriptions s
+       LEFT JOIN channels c ON s.channel_email = c.email
+       WHERE s.subscriber_email = $1
+       ORDER BY s.subscribed_at DESC`,
+      [subscriberEmail]
+    );
+
+    res.json({ success: true, subscriptions: result.rows, count: result.rowCount });
+  } catch (err) {
+    console.error('Get subscriptions error:', err);
+    res.status(500).json({ success: false, error: 'Failed to get subscriptions' });
+  }
+});
+
+// ── Toggle notifications ──────────────────────────────────────────────────────
+router.patch('/subscriptions/:channelEmail/notifications', verifyFirebaseToken, async (req, res) => {
+  try {
+    const channelEmail    = decodeURIComponent(req.params.channelEmail);
+    const subscriberEmail = req.user.email;
+
+    const result = await pool.query(
+      `UPDATE subscriptions
+       SET notifications_enabled = NOT notifications_enabled
+       WHERE subscriber_email=$1 AND channel_email=$2
+       RETURNING notifications_enabled`,
+      [subscriberEmail, channelEmail]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, error: 'Subscription not found' });
+    }
+
+    res.json({ success: true, notificationsEnabled: result.rows[0].notifications_enabled });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to toggle notifications' });
+  }
+});
+
+// ── Videos from subscribed channels ──────────────────────────────────────────
+router.get('/subscriptions/feed', verifyFirebaseToken, async (req, res) => {
+  try {
+    const subscriberEmail = req.user.email;
+    const limit  = Math.min(parseInt(req.query.limit ) || 20, 50);
+    const offset = parseInt(req.query.offset) || 0;
+
+    const result = await pool.query(
+      `SELECT 
+         v.id, v.filename, v.title, v.description,
+         v.uploader_email, v.views, v.likes, v.duration,
+         v.created_at, v.category
+       FROM videos v
+       INNER JOIN subscriptions s ON s.channel_email = v.uploader_email
+       WHERE s.subscriber_email = $1
+         AND v.status = 'ready'
+       ORDER BY v.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [subscriberEmail, limit, offset]
+    );
+
+    const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'http://18.218.164.106:5000';
+    const videos = result.rows.map(v => {
+      const base = v.filename.replace(/\.[^/.]+$/, '');
+      return {
+        ...v,
+        url: `${PUBLIC_BASE_URL}/hls/${base}/master.m3u8`,
+        thumbnail: `${PUBLIC_BASE_URL}/hls/thumbnails/${base}/thumb_0001.jpg`,
+      };
+    });
+
+    res.json({ success: true, videos, count: result.rowCount });
+  } catch (err) {
+    console.error('Subscriptions feed error:', err);
+    res.status(500).json({ success: false, error: 'Failed to get feed' });
+  }
+});
+
+// ── Channel info ──────────────────────────────────────────────────────────────
+router.get('/channel/:channelEmail', async (req, res) => {
+  try {
+    const channelEmail = decodeURIComponent(req.params.channelEmail);
+
+    const [channelResult, videoStats] = await Promise.all([
+      pool.query(
+        'SELECT * FROM channels WHERE email=$1',
+        [channelEmail]
+      ),
+      pool.query(
+        `SELECT COUNT(*) as video_count,
+                COALESCE(SUM(views),0) as total_views,
+                COALESCE(SUM(likes),0) as total_likes,
+                MIN(created_at) as joined_date
+         FROM videos
+         WHERE uploader_email=$1 AND status='ready'`,
+        [channelEmail]
+      )
+    ]);
+
+    const ch    = channelResult.rows[0];
+    const stats = videoStats.rows[0];
+
+    res.json({
+      success: true,
+      channel: {
+        email: channelEmail,
+        channelName: ch?.channel_name || channelEmail.split('@')[0],
+        description: ch?.description || '',
+        bannerUrl: ch?.banner_url || null,
+        subscriberCount: ch?.subscriber_count || 0,
+        videoCount: parseInt(stats.video_count) || 0,
+        totalViews: parseInt(stats.total_views) || 0,
+        totalLikes: parseInt(stats.total_likes) || 0,
+        joinedDate: stats.joined_date,
+      }
+    });
+  } catch (err) {
+    console.error('Channel info error:', err);
+    res.status(500).json({ success: false, error: 'Failed to get channel info' });
+  }
+});
+
+export default router;

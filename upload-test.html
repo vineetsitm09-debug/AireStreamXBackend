@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AirStream Upload Test</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      text-align: center;
+      padding-top: 60px;
+    }
+    input, button {
+      margin: 10px;
+      padding: 10px;
+      font-size: 16px;
+      border-radius: 6px;
+      border: none;
+    }
+    button {
+      background-color: #1f6feb;
+      color: white;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #2b7aff;
+    }
+    #response {
+      margin-top: 25px;
+      color: #3fb950;
+      font-size: 16px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎬 AirStream Video Upload Test</h1>
+  <input type="file" id="fileInput" accept="video/mp4" />
+  <br>
+  <button onclick="uploadVideo()">Upload</button>
+  <div id="response"></div>
+
+  <script>
+    async function uploadVideo() {
+      const fileInput = document.getElementById("fileInput");
+      const file = fileInput.files[0];
+      if (!file) return alert("Please choose a video file!");
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const response = await fetch("http://18.218.164.106:5000/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      const result = await response.json();
+      const responseDiv = document.getElementById("response");
+
+      if (result.success) {
+        responseDiv.innerHTML = `
+          ✅ Uploaded successfully!<br>
+          <a href="${result.video_url}" target="_blank" style="color: #58a6ff;">
+            ${result.video_url}
+          </a>
+        `;
+      } else {
+        responseDiv.innerHTML = `❌ Upload failed: ${result.error || "Unknown error"}`;
+      }
+    }
+  </script>
+</body>
+</html>
