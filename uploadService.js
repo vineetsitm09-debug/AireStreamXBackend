@@ -15,13 +15,15 @@ import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
 import { fileURLToPath } from "url";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 import path from "path";
 import fs from "fs";
 import { Client as MinioClient } from "minio";
 import { verifyFirebaseToken } from "./middleware/verifyFirebaseToken.js";
 import http from "http";
 import subscriptionRoutes from './routes/subscriptionRoutes.js';
-
+import liveRoutes from "./routes/liveRoutes.js";
 // ----------------------------------------------------------------------
 // CONFIGURATION
 // ----------------------------------------------------------------------
@@ -45,6 +47,7 @@ const RATE_LIMIT_MAX      = isDevelopment ? 1000 : 100;
 const app = express();
 app.set("trust proxy", 1);
 
+// Body parsing & security middleware MUST come before any routes
 app.use(express.json());
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
@@ -95,11 +98,10 @@ app.use(cors({
   maxAge: 86400,
 }));
 
-// ----------------------------------------------------------------------
-// PATH HELPERS
-// ----------------------------------------------------------------------
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
+// Static files and routers (after middleware so req.body is available)
+app.use("/hls", express.static(path.join(__dirname, "hls")));
+app.use("/api", subscriptionRoutes);
+app.use("/live", liveRoutes);
 
 // ----------------------------------------------------------------------
 // MINIO WITH CONNECTION POOLING
@@ -330,11 +332,6 @@ function rateLimitMiddleware(req, res, next) {
 }
 
 app.use(rateLimitMiddleware);
-
-// ----------------------------------------------------------------------
-// SUBSCRIPTION ROUTES
-// ----------------------------------------------------------------------
-app.use('/api', subscriptionRoutes);
 
 // ----------------------------------------------------------------------
 // INPUT SANITIZATION
@@ -1375,163 +1372,6 @@ app.use((err, req, res, next) => {
   }
 
   res.status(500).json({ error: 'Internal server error' });
-});
-
-// ----------------------------------------------------------------------
-// LIVE STREAMING
-// ----------------------------------------------------------------------
-function generateStreamKey() {
-  return crypto.randomBytes(16).toString("hex");
-}
-
-app.post("/live/start", verifyFirebaseToken, async (req, res) => {
-  try {
-    const { title, description, thumbnail } = req.body;
-    const userEmail = req.user.email;
-    const userId    = req.user.uid;
-
-    if (!title || title.trim().length === 0) {
-      return res.status(400).json({ error: "Stream title is required" });
-    }
-
-    const streamKey = generateStreamKey();
-    const streamId  = `stream_${Date.now()}_${userId.slice(0, 8)}`;
-    const streamUrl = `rtmp://18.218.164.106:1935/live/${streamKey}`;
-    const hlsUrl    = `${PUBLIC_BASE_URL}/live/hls/${streamKey}/index.m3u8`;
-
-    await pool.query(
-      `INSERT INTO live_streams (
-         id, user_email, user_uid, title, description, thumbnail,
-         stream_key, stream_url, hls_url, status, viewers, created_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'starting',0,NOW())`,
-      [streamId, userEmail, userId, title.trim(), description||'', thumbnail||null,
-       streamKey, streamUrl, hlsUrl]
-    );
-
-    res.json({ success: true, streamId, streamKey, streamUrl, hlsUrl });
-  } catch (err) {
-    console.error("[Live] Start stream error:", err);
-    res.status(500).json({ error: "Failed to start stream" });
-  }
-});
-
-app.post("/live/:streamId/stop", verifyFirebaseToken, async (req, res) => {
-  try {
-    const { streamId } = req.params;
-    const userEmail    = req.user.email;
-
-    const check = await pool.query(
-      "SELECT id FROM live_streams WHERE id = $1 AND user_email = $2",
-      [streamId, userEmail]
-    );
-
-    if (check.rowCount === 0) {
-      return res.status(404).json({ error: "Stream not found or unauthorized" });
-    }
-
-    await pool.query(
-      "UPDATE live_streams SET status = 'ended', ended_at = NOW() WHERE id = $1",
-      [streamId]
-    );
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("[Live] Stop stream error:", err);
-    res.status(500).json({ error: "Failed to stop stream" });
-  }
-});
-
-app.get("/live/active", async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, user_email AS username, title, description, thumbnail,
-              viewers, created_at AS started_at, status, hls_url
-       FROM live_streams
-       WHERE status IN ('starting', 'live')
-       ORDER BY viewers DESC, created_at DESC
-       LIMIT 20`
-    );
-    res.json({ success: true, streams: result.rows });
-  } catch (err) {
-    console.error("[Live] Fetch active streams error:", err);
-    res.status(500).json({ error: "Failed to fetch streams" });
-  }
-});
-
-// IMPORTANT: /live/user/streams MUST come before /live/:streamId
-// or Express will treat "user" as a streamId
-app.get("/live/user/streams", verifyFirebaseToken, async (req, res) => {
-  try {
-    const userEmail = req.user.email;
-
-    const result = await pool.query(
-      `SELECT id, title, description, status, viewers,
-              created_at AS started_at, ended_at
-       FROM live_streams
-       WHERE user_email = $1
-       ORDER BY created_at DESC
-       LIMIT 10`,
-      [userEmail]
-    );
-
-    res.json({ success: true, streams: result.rows });
-  } catch (err) {
-    console.error("[Live] Fetch user streams error:", err);
-    res.status(500).json({ error: "Failed to fetch user streams" });
-  }
-});
-
-app.get("/live/:streamId", async (req, res) => {
-  try {
-    const { streamId } = req.params;
-
-    const result = await pool.query(
-      `SELECT id, user_email AS username, title, description, thumbnail,
-              hls_url, viewers, created_at AS started_at, status
-       FROM live_streams
-       WHERE id = $1`,
-      [streamId]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Stream not found" });
-    }
-
-    res.json({ success: true, ...result.rows[0] });
-  } catch (err) {
-    console.error("[Live] Fetch stream error:", err);
-    res.status(500).json({ error: "Failed to fetch stream" });
-  }
-});
-
-app.post("/live/:streamId/viewer", async (req, res) => {
-  try {
-    const { streamId } = req.params;
-    const { action }   = req.body;
-
-    if (!['join', 'leave'].includes(action)) {
-      return res.status(400).json({ error: "Invalid action" });
-    }
-
-    const increment = action === 'join' ? 1 : -1;
-
-    await pool.query(
-      "UPDATE live_streams SET viewers = GREATEST(viewers + $1, 0) WHERE id = $2",
-      [increment, streamId]
-    );
-
-    if (action === 'join') {
-      await pool.query(
-        "UPDATE live_streams SET status = 'live' WHERE id = $1 AND status = 'starting'",
-        [streamId]
-      );
-    }
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("[Live] Update viewer error:", err);
-    res.status(500).json({ error: "Failed to update viewers" });
-  }
 });
 
 // GRACEFUL SHUTDOWN

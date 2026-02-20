@@ -21,8 +21,8 @@ const __dirname = path.dirname(__filename);
 // ---------------- CONFIG ----------------
 const REDIS_HOST = "127.0.0.1";
 const REDIS_PORT = 6379;
-const API_HOST = "18.218.164.106";
-const API_PORT = 5000;
+const API_HOST = process.env.API_HOST || "127.0.0.1";
+const API_PORT = parseInt(process.env.API_PORT || "5000", 10);
 
 // OPTIMIZED: More parallel processes
 const MAX_CONCURRENT_PROCESSES = 6; // Increased from 4

@@ -1,0 +1,87 @@
+--- a/uploadService.js
++++ b/uploadService.js
+@@
+-import subscriptionRoutes from './routes/subscriptionRoutes.js';
++import subscriptionRoutes from './routes/subscriptionRoutes.js';
++import liveRoutes from './routes/liveRoutes.js';
+@@
+-app.use('/api', subscriptionRoutes);
++app.use('/hls', express.static(path.join(__dirname, 'hls')));
++app.use('/api', subscriptionRoutes);
++app.use('/live', liveRoutes);
+
+
+--- /dev/null
++++ b/routes/liveRoutes.js
+@@
++import express from "express";
++import crypto from "crypto";
++import { pool } from "../db.js";
++import { verifyFirebaseToken as authenticate } from "../middleware/verifyFirebaseToken.js";
++
++const router = express.Router();
++
++router.post("/start", authenticate, async (req, res) => {
++  const { title, description } = req.body ?? {};
++  const uid = req.user?.uid;
++  const email = req.user?.email ?? null;
++  if (!uid) return res.status(400).json({ error: "Missing user" });
++
++  const streamKey = crypto.randomBytes(16).toString("hex");
++  const host = process.env.API_HOST || req.get("host");
++  const origin = `${req.protocol}://${host}`;
++  const ingestUrl = process.env.RTMP_INGEST_URL || `rtmp://${host}:1935/live/${streamKey}`;
++
++  const { rows } = await pool.query(
++    `INSERT INTO live_streams (user_id, user_email, title, description, stream_key, status, ingest_url)
++     VALUES ($1,$2,$3,$4,$5,'starting',$6)
++     RETURNING id`,
++    [uid, email, title ?? null, description ?? null, streamKey, ingestUrl]
++  );
++
++  const streamId = rows[0].id;
++  const hlsUrl = `${origin}/hls/live/${streamId}/master.m3u8`;
++
++  await pool.query(
++    `UPDATE live_streams SET status='live', hls_url=$1 WHERE id=$2`,
++    [hlsUrl, streamId]
++  );
++
++  res.json({ stream_id: streamId, stream_key: streamKey, ingest_url: ingestUrl, hls_url: hlsUrl });
++});
++
++router.post("/:streamId/stop", authenticate, async (req, res) => {
++  const uid = req.user?.uid;
++  const streamId = parseInt(req.params.streamId, 10);
++  if (!uid || Number.isNaN(streamId)) return res.status(400).json({ error: "Invalid request" });
++
++  await pool.query(
++    `UPDATE live_streams SET status='ended', ended_at=NOW() WHERE id=$1 AND user_id=$2`,
++    [streamId, uid]
++  );
++
++  res.json({ ok: true });
++});
++
++export default router;
+
+
+--- a/workerService.js
++++ b/workerService.js
+@@
+-const API_HOST = "18.218.164.106";
+-const API_PORT = 5000;
++const API_HOST = process.env.API_HOST || "127.0.0.1";
++const API_PORT = parseInt(process.env.API_PORT || "5000", 10);
+@@
+-  const videoUrl = `http://${API_HOST}:${API_PORT}/hls/${baseName}/master.m3u8`;
+-  await pool.query(
+-    `UPDATE videos SET status='ready', video_url=$1, duration=$2, processed_at=NOW() WHERE id=$3`,
+-    [videoUrl, duration, videoId]
+-  );
++  const videoUrl = `http://${API_HOST}:${API_PORT}/hls/${baseName}/master.m3u8`;
++  const thumbnailUrl = `http://${API_HOST}:${API_PORT}/hls/thumbnails/${baseName}/thumb_0001.jpg`;
++  await pool.query(
++    `UPDATE videos SET status='ready', video_url=$1, thumbnail_url=$2, duration=$3, processed_at=NOW() WHERE id=$4`,
++    [videoUrl, thumbnailUrl, duration, videoId]
++  );
